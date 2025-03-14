@@ -42,6 +42,7 @@ import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.Stack;
 
 import jdk.internal.access.JavaLangAccess;
 import jdk.internal.access.SharedSecrets;
@@ -254,6 +255,55 @@ import jdk.internal.util.ByteArray;
 public class ObjectInputStream
     extends InputStream implements ObjectInput, ObjectStreamConstants
 {
+    /* TODO describe whats happening in a big comment here 
+     - stack marker is the point at which we stop the search
+    */
+    private static class LUDCLHelper {
+        private static class LUDCLEntry {
+            public ClassLoader ludcl;
+            public long stackMarker;
+        }
+
+        private static ThreadLocal<Stack<LUDCLEntry>> tl_stack =  new ThreadLocal<Stack<LUDCLEntry>>() {
+            @Override
+            protected Stack<LUDCLEntry> initialValue() {
+                return new Stack<LUDCLEntry>();
+            }
+        };
+
+        public static void push() {
+            push(lookup());
+        }
+
+        public static void push(ClassLoader cl) {
+            Stack<LUDCLEntry> stack = tl_stack.get();
+            LUDCLEntry entry = new LUDCLEntry();
+            entry.ludcl = cl;
+            entry.stackMarker = com.ibm.oti.vm.VM.getStackMarker();
+            stack.push(entry);
+        }
+
+        public static void pop() {
+            Stack<LUDCLEntry>  stack = tl_stack.get();
+            stack.pop();
+        }
+
+        public static ClassLoader lookup() {
+            Stack<LUDCLEntry> stack = tl_stack.get();
+            ClassLoader cl;
+            if (stack.empty()) {
+                cl = jdk.internal.misc.VM.latestUserDefinedLoader();
+            } else {
+                LUDCLEntry ludclEntry = stack.peek();
+                cl = com.ibm.oti.vm.VM.ludclSearchFromMarker(ludclEntry.stackMarker);
+                if (null == cl) {
+                    cl = ludclEntry.ludcl;
+                }
+            }
+            return cl;
+        }
+    }
+
     /** handle value representing null */
     private static final int NULL_HANDLE = -1;
 
@@ -364,13 +414,6 @@ public class ObjectInputStream
     /* ClassByNameCache Entry for caching class.forName results upon enableClassCaching. */
     private static final ClassByNameCache classByNameCache =
             isClassCachingEnabled ? new ClassByNameCache() : null;
-
-    private ClassLoader cachedLudcl;
-    /* If user code is invoked in the middle of a call to readObject the cachedLudcl
-     * must be refreshed as the ludcl could have been changed while in user code.
-     */
-    private boolean refreshLudcl;
-    private Object startingLudclObject;
 
     /**
      * Creates an ObjectInputStream that reads from the specified InputStream.
@@ -535,26 +578,16 @@ public class ObjectInputStream
         if (! (type == Object.class || type == String.class))
             throw new AssertionError("internal error");
 
-        ClassLoader oldCachedLudcl = null;
         boolean setCached = false;
-
-        if (((null == curContext) || refreshLudcl) && isClassCachingEnabled) {
-            oldCachedLudcl = cachedLudcl;
-            setCached = true;
-
+        if ((null == curContext) && isClassCachingEnabled) {
             // If caller is not provided, follow the standard path to get the cachedLudcl.
             // Otherwise use the class loader provided by JIT as the cachedLudcl.
-
             if (caller == null) {
-                refreshLudcl = true;
+                LUDCLHelper.push();
             } else {
-                cachedLudcl = caller.getClassLoader();
-                refreshLudcl = false;
+                LUDCLHelper.push(caller.getClassLoader());
             }
-
-            if (null == startingLudclObject) {
-                startingLudclObject = this;
-            }
+            setCached = true;
         }
 
         // if nested read, passHandle contains handle of enclosing object
@@ -572,14 +605,9 @@ public class ObjectInputStream
             }
             return obj;
         } finally {
-            /* Back to the start, refresh ludcl cache on next call. */
-            if (this == startingLudclObject) {
-                refreshLudcl = true;
-                startingLudclObject = null;
-            }
             passHandle = outerHandle;
             if (setCached) {
-                cachedLudcl = oldCachedLudcl;
+                LUDCLHelper.pop();
             }
             if (closed && depth == 0) {
                 clear();
@@ -654,16 +682,10 @@ public class ObjectInputStream
      * @since   1.4
      */
     public Object readUnshared() throws IOException, ClassNotFoundException {
-        ClassLoader oldCachedLudcl = null;
         boolean setCached = false;
-
-        if (((null == curContext) || refreshLudcl) && isClassCachingEnabled) {
-            oldCachedLudcl = cachedLudcl;
+        if ((null == curContext) && isClassCachingEnabled) {
+            LUDCLHelper.push();
             setCached = true;
-            refreshLudcl = true;
-            if (null == startingLudclObject) {
-                startingLudclObject = this;
-            }
         }
 
         // if nested read, passHandle contains handle of enclosing object
@@ -681,14 +703,9 @@ public class ObjectInputStream
             }
             return obj;
         } finally {
-            /* Back to the start, refresh ludcl cache on next call. */
-            if (this == startingLudclObject) {
-                refreshLudcl = true;
-                startingLudclObject = null;
-            }
             passHandle = outerHandle;
             if (setCached) {
-                cachedLudcl = oldCachedLudcl;
+                LUDCLHelper.pop();
             }
             if (closed && depth == 0) {
                 clear();
@@ -849,11 +866,7 @@ public class ObjectInputStream
             if (null == classByNameCache) {
                 return Class.forName(name, false, latestUserDefinedLoader());
             } else {
-                if (refreshLudcl) {
-                    cachedLudcl = latestUserDefinedLoader();
-                    refreshLudcl = false;
-                }
-                return classByNameCache.get(name, cachedLudcl);
+                return classByNameCache.get(name, LUDCLHelper.lookup());
             }
         } catch (ClassNotFoundException ex) {
             Class<?> cl = Class.forPrimitiveName(name);
@@ -2276,8 +2289,6 @@ public class ObjectInputStream
             handles.lookupException(passHandle) == null &&
             desc.hasReadResolveMethod())
         {
-            /* user code is invoked */
-            refreshLudcl = true;
             Object rep = desc.invokeReadResolve(obj);
             if (unshared && rep.getClass().isArray()) {
                 rep = cloneArray(rep);
@@ -2439,8 +2450,6 @@ public class ObjectInputStream
 
                         bin.setBlockDataMode(true);
 
-                        /* user code is invoked */
-                        refreshLudcl = true;
                         slotDesc.invokeReadObject(obj, this);
                     } catch (ClassNotFoundException ex) {
                         /*
@@ -2488,8 +2497,6 @@ public class ObjectInputStream
                     slotDesc.hasReadObjectNoDataMethod() &&
                     handles.lookupException(passHandle) == null)
                 {
-                    /* user code is invoked */
-                    refreshLudcl = true;
                     slotDesc.invokeReadObjectNoData(obj);
                 }
             }
